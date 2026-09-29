@@ -264,9 +264,10 @@
       net.open = false; net.conn = null; releasePartner();
       if (was) addNote('상대가 나갔어요');
       if (net.slot === 'b') restart();         // 손님이었다면 처음부터 다시 자리 잡기
-      else setStatus('상대를 기다리는 중');
+      else setStatus('상대를 기다리는 중 · 방 ' + roomName);
     };
-    conn.on('close', lost); conn.on('error', lost);
+    conn.on('close', lost);
+    conn.on('error', e => { console.warn('[conn]', e); lost(); });
   }
   function restart(delay = 1200) {
     try { net.peer && net.peer.destroy(); } catch (_) {}
@@ -275,34 +276,50 @@
   }
   function claim(slot) {
     return new Promise(res => {
-      const peer = new Peer(PREFIX + slot, { debug: 0 });
+      const peer = new PeerCtor(PREFIX + slot, { debug: 1 });
       let done = false;
       peer.on('open', () => { if (!done) { done = true; res(peer); } });
+      peer.on('disconnected', () => { try { if (!peer.destroyed) peer.reconnect(); } catch (_) {} });
       peer.on('error', err => {
         if (done) { if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') restart(3000); return; }
         done = true; try { peer.destroy(); } catch (_) {}
+        net.lastErr = err.type || String(err);
+        console.warn('[peer]', slot, err.type, err);
         res(err.type === 'unavailable-id' ? 'taken' : null);
       });
     });
   }
+  let PeerCtor = null;
+  function loadPeer() {
+    PeerCtor = window.Peer || (window.peerjs && window.peerjs.Peer) || null;
+    if (PeerCtor) return Promise.resolve(true);
+    // 첫 번째 주소가 막혔으면 다른 주소에서 한 번 더
+    return new Promise(res => {
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js';
+      s.onload = () => { PeerCtor = window.Peer || (window.peerjs && window.peerjs.Peer) || null; res(!!PeerCtor); };
+      s.onerror = () => res(false);
+      document.head.appendChild(s);
+    });
+  }
   async function join() {
-    if (typeof Peer === 'undefined') { setStatus('연결 기능을 불러오지 못했어요'); return; }
+    if (!PeerCtor && !(await loadPeer())) { setStatus('연결 기능을 불러오지 못했어요 (인터넷 연결이나 광고 차단 확장 프로그램을 확인해주세요)'); return; }
     setStatus('연결하는 중');
     // 1) 첫 번째 자리
     let r = await claim('a');
     if (r && r !== 'taken') {
-      net.peer = r; net.slot = 'a'; setStatus('상대를 기다리는 중');
+      net.peer = r; net.slot = 'a'; setStatus('상대를 기다리는 중 · 방 ' + roomName);
       r.on('connection', conn => {
         if (net.conn) { conn.on('open', () => { conn.send({ t: 'full' }); setTimeout(() => conn.close(), 300); }); return; }
         attach(conn);
       });
       return;
     }
-    if (r === null) { setStatus('연결하지 못했어요. 잠시 후 다시 시도할게요'); return restart(5000); }
+    if (r === null) { setStatus('연결하지 못했어요 (' + net.lastErr + '). 잠시 후 다시 시도할게요'); return restart(5000); }
     // 2) 두 번째 자리 → 첫 번째 사람에게 연결
     r = await claim('b');
     if (r === 'taken') { setStatus('지금은 두 사람이 대화 중이에요. 자리가 나면 들어올 수 있어요'); return restart(6000); }
-    if (r === null) { setStatus('연결하지 못했어요. 잠시 후 다시 시도할게요'); return restart(5000); }
+    if (r === null) { setStatus('연결하지 못했어요 (' + net.lastErr + '). 잠시 후 다시 시도할게요'); return restart(5000); }
     net.peer = r; net.slot = 'b';
     const conn = r.connect(PREFIX + 'a', { reliable: true });
     attach(conn);
