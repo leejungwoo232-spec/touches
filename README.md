@@ -67,7 +67,7 @@
     font-size: 16px; /* iOS 자동 확대 방지 */
   }
 </style>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5/dist/mqtt.min.js"></script>
 </head>
 <body>
 <canvas id="stage" tabindex="0" aria-label="키를 누르면 해당 위치의 천이 눌립니다"></canvas>
@@ -231,86 +231,109 @@
   addEventListener('keydown', onDown, true);
   addEventListener('keyup', onUp, true);
   addEventListener('blur', () => dents.forEach(d => d.held = false));
-  // ── 두 사람만 들어올 수 있는 방 (PeerJS: 계정·서버 없이 브라우저끼리 직접 연결) ──
-  // 주소 뒤에 ?room=이름 을 붙이면 다른 방이 생김. 방마다 자리(a, b)는 두 개뿐.
+  // ── 두 사람만 들어올 수 있는 방 ──
+  // 공개 MQTT 중계 서버를 통해 메시지를 주고받음 (계정·설정 없음, 일반 웹 연결이라 대부분의 네트워크에서 통과)
+  // 주소 뒤에 ?room=이름 을 붙이면 다른 방. 방마다 먼저 들어온 두 사람만 대화에 참여.
   const statusEl = document.getElementById('status');
   const setStatus = txt => { statusEl.hidden = !txt; statusEl.textContent = txt || ''; };
   const roomName = (new URLSearchParams(location.search).get('room') || 'main').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 32) || 'main';
-  const PREFIX = 'elastic-cloth-7q2x-' + roomName + '-';
+  const BASE = 'elastic-cloth-7q2x/v1/' + roomName + '/';
+  const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt'];
   const CODE_RE = /^[A-Za-z0-9]{1,24}$/;
-  const net = { peer: null, conn: null, open: false };
+  const myId = Math.random().toString(36).slice(2, 12);
+  const since = Date.now() + Math.random();
+  const seen = new Map();              // id -> { since, last }
+  const net = { client: null, inRoom: false, partner: null, ready: false };
+  const dec = new TextDecoder();
 
-  function netSend(obj) { if (net.open) try { net.conn.send(obj); } catch (_) {} }
+  function netSend(obj) {
+    if (!net.client || !net.inRoom || !net.partner) return;
+    try { net.client.publish(BASE + 'm', JSON.stringify(Object.assign({ from: myId, to: net.partner }, obj)), { qos: 0 }); } catch (_) {}
+  }
   function send_chat(txt) { netSend({ t: 'chat', text: txt }); }
   function netKey(code, down) { if (CODE_RE.test(code)) netSend({ t: 'key', code, down: !!down }); }
   function releasePartner() { for (const [id, dn] of dents) if (id.startsWith('r:')) dn.held = false; }
 
-  function onData(d) {
-    if (!d || typeof d !== 'object') return;
-    if (d.t === 'chat' && typeof d.text === 'string' && d.text.trim()) addMsg(d.text.slice(0, 1000), true);
-    else if (d.t === 'key' && typeof d.code === 'string' && CODE_RE.test(d.code)) {
-      const id = 'r:' + d.code;
-      if (d.down) { if (!dents.get(id)?.held) pressKey(id, d.code, true); }
-      else release(id);
-    }
+  function announce() {
+    if (!net.client) return;
+    try { net.client.publish(BASE + 'p/' + myId, JSON.stringify({ since, t: Date.now() }), { qos: 1, retain: true }); } catch (_) {}
   }
-  function attach(conn) {
-    net.conn = conn;
-    conn.on('open', () => { net.open = true; setStatus('상대와 연결됨'); addNote('상대가 들어왔어요'); });
-    conn.on('data', onData);
-    const lost = () => {
-      if (net.conn !== conn) return;
-      const was = net.open;
-      net.open = false; net.conn = null; releasePartner();
-      if (was) addNote('상대가 나갔어요');
-      if (net.slot === 'b') restart();         // 손님이었다면 처음부터 다시 자리 잡기
-      else setStatus('상대를 기다리는 중');
-    };
-    conn.on('close', lost); conn.on('error', lost);
+  function evaluate() {
+    if (!net.ready) return;
+    const now = Date.now();
+    for (const [id, p] of seen) if (id !== myId && now - p.last > 25000) seen.delete(id);   // 오래 소식 없는 흔적은 버림
+    seen.set(myId, { since, last: now });
+    const two = [...seen.entries()].sort((x, y) => (x[1].since - y[1].since) || (x[0] < y[0] ? -1 : 1)).slice(0, 2).map(e => e[0]);
+    const was = net.partner;
+    net.inRoom = two.includes(myId);
+    net.partner = net.inRoom ? (two.find(id => id !== myId) || null) : null;
+    if (!net.inRoom) setStatus('지금은 두 사람이 대화 중이에요. 자리가 나면 들어올 수 있어요');
+    else if (net.partner) setStatus('상대와 연결됨');
+    else setStatus('상대를 기다리는 중 · 방 ' + roomName);
+    if (net.partner && net.partner !== was) addNote('상대가 들어왔어요');
+    if (was && net.partner !== was) { addNote('상대가 나갔어요'); releasePartner(); }
   }
-  function restart(delay = 1200) {
-    try { net.peer && net.peer.destroy(); } catch (_) {}
-    net.peer = null; net.open = false; net.conn = null;
-    setTimeout(join, delay);
-  }
-  function claim(slot) {
-    return new Promise(res => {
-      const peer = new Peer(PREFIX + slot, { debug: 0 });
-      let done = false;
-      peer.on('open', () => { if (!done) { done = true; res(peer); } });
-      peer.on('error', err => {
-        if (done) { if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') restart(3000); return; }
-        done = true; try { peer.destroy(); } catch (_) {}
-        res(err.type === 'unavailable-id' ? 'taken' : null);
-      });
-    });
-  }
-  async function join() {
-    if (typeof Peer === 'undefined') { setStatus('연결 기능을 불러오지 못했어요'); return; }
-    setStatus('연결하는 중');
-    // 1) 첫 번째 자리
-    let r = await claim('a');
-    if (r && r !== 'taken') {
-      net.peer = r; net.slot = 'a'; setStatus('상대를 기다리는 중');
-      r.on('connection', conn => {
-        if (net.conn) { conn.on('open', () => { conn.send({ t: 'full' }); setTimeout(() => conn.close(), 300); }); return; }
-        attach(conn);
-      });
+  function onMessage(topic, payload, packet) {
+    let s = ''; try { s = typeof payload === 'string' ? payload : dec.decode(payload); } catch (_) { return; }
+    if (topic.startsWith(BASE + 'p/')) {
+      const id = topic.slice((BASE + 'p/').length);
+      if (!/^[a-z0-9]{1,16}$/.test(id) || id === myId) return;
+      if (!s) { seen.delete(id); evaluate(); return; }
+      let d; try { d = JSON.parse(s); } catch (_) { return; }
+      if (!d || typeof d.since !== 'number' || typeof d.t !== 'number') return;
+      const last = packet && packet.retain ? Math.min(Date.now(), d.t) : Date.now();
+      seen.set(id, { since: d.since, last });
+      evaluate();
       return;
     }
-    if (r === null) { setStatus('연결하지 못했어요. 잠시 후 다시 시도할게요'); return restart(5000); }
-    // 2) 두 번째 자리 → 첫 번째 사람에게 연결
-    r = await claim('b');
-    if (r === 'taken') { setStatus('지금은 두 사람이 대화 중이에요. 자리가 나면 들어올 수 있어요'); return restart(6000); }
-    if (r === null) { setStatus('연결하지 못했어요. 잠시 후 다시 시도할게요'); return restart(5000); }
-    net.peer = r; net.slot = 'b';
-    const conn = r.connect(PREFIX + 'a', { reliable: true });
-    attach(conn);
-    conn.on('data', d => { if (d && d.t === 'full') { setStatus('지금은 두 사람이 대화 중이에요'); } });
-    setTimeout(() => { if (!net.open && net.peer === r) restart(2000); }, 8000);   // 첫 자리가 비어 있던 흔적이면 다시
+    if (topic === BASE + 'm') {
+      let d; try { d = JSON.parse(s); } catch (_) { return; }
+      if (!d || d.to !== myId || !net.partner || d.from !== net.partner) return;
+      if (d.t === 'chat' && typeof d.text === 'string' && d.text.trim()) addMsg(d.text.slice(0, 1000), true);
+      else if (d.t === 'key' && typeof d.code === 'string' && CODE_RE.test(d.code)) {
+        const id = 'r:' + d.code;
+        if (d.down) { if (!dents.get(id)?.held) pressKey(id, d.code, true); }
+        else release(id);
+      }
+    }
   }
-  addEventListener('load', () => join());
-  addEventListener('beforeunload', () => { try { net.peer && net.peer.destroy(); } catch (_) {} });
+  function loadLib() {
+    if (window.mqtt) return Promise.resolve(true);
+    return new Promise(res => {
+      const s = document.createElement('script');
+      s.src = 'https://unpkg.com/mqtt@5/dist/mqtt.min.js';
+      s.onload = () => res(!!window.mqtt); s.onerror = () => res(false);
+      document.head.appendChild(s);
+    });
+  }
+  async function connect(bi = 0) {
+    if (!(await loadLib())) { setStatus('연결 기능을 불러오지 못했어요 (인터넷 연결이나 광고 차단 확장 프로그램을 확인해주세요)'); return; }
+    setStatus('연결하는 중');
+    let ever = false;
+    const c = window.mqtt.connect(BROKERS[bi], {
+      clientId: 'ec_' + myId, clean: true, keepalive: 10, reconnectPeriod: 2000, connectTimeout: 8000,
+      will: { topic: BASE + 'p/' + myId, payload: '', qos: 1, retain: true },
+    });
+    net.client = c;
+    c.on('connect', () => {
+      ever = true;
+      c.subscribe([BASE + 'p/+', BASE + 'm'], { qos: 0 }, () => {
+        announce();
+        setTimeout(() => { net.ready = true; evaluate(); }, 1200);   // 방에 있던 사람들 정보를 먼저 받고 판단
+      });
+    });
+    c.on('message', onMessage);
+    c.on('offline', () => { if (ever) setStatus('연결이 잠시 끊겼어요. 다시 잇는 중'); });
+    c.on('error', e => console.warn('[mqtt]', e && e.message));
+    // 첫 서버에 못 붙으면 두 번째 서버로
+    setTimeout(() => { if (!ever && bi + 1 < BROKERS.length) { try { c.end(true); } catch (_) {} connect(bi + 1); } }, 9000);
+  }
+  setInterval(() => { announce(); evaluate(); }, 8000);
+  addEventListener('load', () => connect());
+  addEventListener('pagehide', () => {
+    if (!net.client) return;
+    try { net.client.publish(BASE + 'p/' + myId, '', { qos: 0, retain: true }); net.client.end(); } catch (_) {}
+  });
 
   // 터치/마우스: 누른 자리
   cv.addEventListener('pointerdown', e => { e.preventDefault(); grabFocus(); }, true);
